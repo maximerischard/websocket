@@ -33,7 +33,7 @@ func sendRecv(t *testing.T, ws *Conn) {
 		t.Fatalf("ReadMessage: %v", err)
 	}
 	if string(p) != message {
-		t.Fatalf("message=%s, want %s", p, message)
+		t.Fatalf("message=%s, want %s", string(p), message)
 	}
 }
 
@@ -41,16 +41,27 @@ func httpToWs(u string) string {
 	return "ws" + u[len("http"):]
 }
 
+func accept_foo_reject_rest(client_extensions ExtensionList) (negotiated_extensions ExtensionList) {
+	for _, requested_ext := range client_extensions {
+		if requested_ext.Token == "foo" {
+			negotiated_extensions = append(negotiated_extensions, requested_ext)
+		}
+	}
+	return negotiated_extensions
+}
+
 var handshakeUpgrader = &Upgrader{
-	Subprotocols:    []string{"p0", "p1"},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	Subprotocols:        []string{"p0", "p1"},
+	ReadBufferSize:      1024,
+	WriteBufferSize:     1024,
+	NegotiateExtensions: accept_foo_reject_rest,
 }
 
 var handshakeDialer = &Dialer{
 	Subprotocols:    []string{"p1", "p2"},
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	Extensions:      []string{"foo", "bar;baz=3"},
 }
 
 type handshakeHandler struct {
@@ -79,6 +90,10 @@ func (t handshakeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ws.Subprotocol() != "p1" {
 		t.Logf("ws.Subprotocol() = %s, want p1", ws.Subprotocol())
 		return
+	}
+
+	if ws.Extensions().String() != "foo" {
+		t.Logf("ws.Extensions = %s, want foo only", ws.Extensions())
 	}
 
 	for {

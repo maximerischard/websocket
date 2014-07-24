@@ -50,7 +50,7 @@ func TestFraming(t *testing.T) {
 
 			var connBuf bytes.Buffer
 			wc := newConn(fakeNetConn{Reader: nil, Writer: &connBuf}, isServer, 1024, 1024)
-			rc := newConn(fakeNetConn{Reader: chunker.f(&connBuf), Writer: nil}, !isServer, 1024, 1024)
+			rc := newConn(fakeNetConn{Reader: chunker.f(&connBuf), Writer: new(bytes.Buffer)}, !isServer, 1024, 1024)
 
 			for _, n := range frameSizes {
 				for _, iocopy := range []bool{true, false} {

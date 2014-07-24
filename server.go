@@ -26,6 +26,34 @@ const (
 	defaultWriteBufferSize = 4096
 )
 
+type ExtensionList []Extension
+
+func (extl ExtensionList) String() string {
+	part_strings := make([]string, len(extl))
+	for i, ext := range extl {
+		part_strings[i] = ext.String()
+	}
+	return strings.Join(part_strings, ", ")
+}
+
+type Extension struct {
+	Token  string
+	Params map[string]string
+}
+
+func (ext Extension) String() string {
+	part_strings := []string{ext.Token}
+	for param_token, param_value := range ext.Params {
+		if param_value != "" {
+			parstring := param_token + "=" + param_value
+			part_strings = append(part_strings, parstring)
+		} else {
+			part_strings = append(part_strings, param_token)
+		}
+	}
+	return strings.Join(part_strings, "; ")
+}
+
 // Upgrader specifies parameters for upgrading an HTTP connection to a
 // WebSocket connection.
 type Upgrader struct {
@@ -51,6 +79,13 @@ type Upgrader struct {
 	// CheckOrigin is nil, the host in the Origin header must match the host of
 	// the request.
 	CheckOrigin func(r *http.Request) bool
+
+	// NegotiateExtensions is the function that responds to the client's
+	// requested extensions (sent in the Sec-Websocket-Extensions header)
+	// by returning a list of accepted extensions. If this field is not set,
+	// then all extensions are rejected and there is no Sec-Websocket-Extensions
+	// header in the reply.
+	NegotiateExtensions func(client_extensions ExtensionList) (negotiated_extensions ExtensionList)
 }
 
 func (u *Upgrader) returnError(w http.ResponseWriter, r *http.Request, status int, reason string) (*Conn, error) {
@@ -73,7 +108,13 @@ func checkSameOrigin(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
+	if u.Host != r.Host {
+	}
 	return u.Host == r.Host
+}
+
+func refuseAllExtensions(client_extensions ExtensionList) (negotiated_extensions ExtensionList) {
+	return negotiated_extensions
 }
 
 func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header) string {
@@ -125,6 +166,12 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 
 	subprotocol := u.selectSubprotocol(r, responseHeader)
 
+	negotiate_extensions := u.NegotiateExtensions
+	if negotiate_extensions == nil {
+		negotiate_extensions = refuseAllExtensions
+	}
+	negotiated_extensions := negotiate_extensions(Extensions(r.Header))
+
 	var (
 		netConn net.Conn
 		br      *bufio.Reader
@@ -154,6 +201,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	}
 	c := newConn(netConn, true, readBufSize, writeBufSize)
 	c.subprotocol = subprotocol
+	c.extensions = negotiated_extensions
 
 	p := c.writeBuf[:0]
 	p = append(p, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "...)
@@ -162,6 +210,11 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	if c.subprotocol != "" {
 		p = append(p, "Sec-Websocket-Protocol: "...)
 		p = append(p, c.subprotocol...)
+		p = append(p, "\r\n"...)
+	}
+	if len(c.extensions) > 0 {
+		p = append(p, "Sec-Websocket-Extensions: "...)
+		p = append(p, c.extensions.String()...)
 		p = append(p, "\r\n"...)
 	}
 	for k, vs := range responseHeader {
@@ -251,4 +304,31 @@ func Subprotocols(r *http.Request) []string {
 		protocols[i] = strings.TrimSpace(protocols[i])
 	}
 	return protocols
+}
+
+// Extensions returns the extension requested by the client in the
+// Sec-Websocket-Extensions header.
+func Extensions(header http.Header) (extensions ExtensionList) {
+	h := strings.TrimSpace(header.Get("Sec-Websocket-Extensions"))
+	if h == "" {
+		return extensions
+	}
+	extension_list := strings.Split(h, ",")
+	for _, l_extension := range extension_list {
+		token_params := strings.Split(l_extension, ";")
+		ext := Extension{Token: strings.TrimSpace(token_params[0]),
+			Params: make(map[string]string),
+		}
+		for _, param := range token_params[1:len(token_params)] {
+			sp := strings.SplitN(param, "=", 2)
+			param_token := strings.TrimSpace(sp[0])
+			if len(sp) == 1 {
+				ext.Params[param_token] = ""
+			} else {
+				ext.Params[param_token] = strings.TrimSpace(sp[1])
+			}
+		}
+		extensions = append(extensions, ext)
+	}
+	return extensions
 }

@@ -90,6 +90,7 @@ var (
 const (
 	maxFrameHeaderSize         = 2 + 8 + 4 // Fixed header + length + mask
 	maxControlFramePayloadSize = 125
+	compressedBit              = 1 << 6 // RSV1
 	finalBit                   = 1 << 7
 	maskBit                    = 1 << 7
 	writeWait                  = time.Second
@@ -128,31 +129,39 @@ type Conn struct {
 	conn        net.Conn
 	isServer    bool
 	subprotocol string
+	extensions  ExtensionList
 
 	// Write fields
 	mu        chan bool // used as mutex to protect write to conn and closeSent
 	closeSent bool      // true if close message was sent
 
 	// Message writer fields.
-	writeErr       error
-	writeBuf       []byte // frame is constructed in this buffer.
-	writePos       int    // end of data in writeBuf.
-	writeFrameType int    // type of the current frame.
-	writeSeq       int    // incremented to invalidate message writers.
-	writeDeadline  time.Time
+	writeErr        error
+	writeBuf        []byte // frame is constructed in this buffer.
+	writePos        int    // end of data in writeBuf.
+	writeFrameType  int    // type of the current frame.
+	writeCompressed bool   // is the message compressed
+	writeSeq        int    // incremented to invalidate message writers.
+	writeDeadline   time.Time
 
 	// Read fields
-	readErr       error
-	br            *bufio.Reader
-	readRemaining int64 // bytes remaining in current frame.
-	readFinal     bool  // true the current message has more frames.
-	readSeq       int   // incremented to invalidate message readers.
-	readLength    int64 // Message size.
-	readLimit     int64 // Maximum message size.
-	readMaskPos   int
-	readMaskKey   [4]byte
-	handlePong    func(string) error
-	handlePing    func(string) error
+	readErr        error
+	br             *bufio.Reader
+	readRemaining  int64 // bytes remaining in current frame.
+	readFinal      bool  // true the current message has more frames.
+	readSeq        int   // incremented to invalidate message readers.
+	readLength     int64 // Message size.
+	readLimit      int64 // Maximum message size.
+	readCompressed bool  // the message we are reading is compressed
+	readMaskPos    int
+	readMaskKey    [4]byte
+	handlePong     func(string) error
+	handlePing     func(string) error
+
+	decompressor   io.Reader
+	compressor     io.Writer
+	readProcessor  func(c *Conn, inputMessageType int, r io.Reader) (messageType int, modifiedReader io.Reader, err error)
+	writeProcessor func(c *Conn, w io.Writer) (modifiedWriter io.WriteCloser, err error)
 }
 
 func newConn(conn net.Conn, isServer bool, readBufSize, writeBufSize int) *Conn {
@@ -177,6 +186,10 @@ func newConn(conn net.Conn, isServer bool, readBufSize, writeBufSize int) *Conn 
 // Subprotocol returns the negotiated protocol for the connection.
 func (c *Conn) Subprotocol() string {
 	return c.subprotocol
+}
+
+func (c *Conn) Extensions() ExtensionList {
+	return c.extensions
 }
 
 // Close closes the underlying network connection without sending or waiting for a close frame.
@@ -321,6 +334,9 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 	}
 
 	b0 := byte(c.writeFrameType)
+	if c.writeCompressed {
+		b0 |= compressedBit
+	}
 	if final {
 		b0 |= finalBit
 	}
@@ -368,6 +384,7 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 	// Setup for next frame.
 	c.writePos = maxFrameHeaderSize
 	c.writeFrameType = continuationFrame
+	c.writeCompressed = false // the RSV1 compressed flag is only set in the initial frame
 	if final {
 		c.writeSeq++
 		c.writeFrameType = noFrame
@@ -432,7 +449,8 @@ func (w messageWriter) write(final bool, p []byte) (int, error) {
 	return nn, nil
 }
 
-func (w messageWriter) Write(p []byte) (int, error) {
+func (w messageWriter) Write(p []byte) (n int, err error) {
+	//n, err = w.write(true, p)
 	return w.write(false, p)
 }
 
@@ -493,17 +511,42 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 	if err != nil {
 		return err
 	}
-	w := wr.(messageWriter)
-	if _, err := w.write(true, data); err != nil {
+	if c.writeProcessor != nil {
+		wr, err = c.writeProcessor(c, wr)
+	}
+	_, err = wr.Write(data)
+	if err != nil {
 		return err
 	}
-	if c.writeSeq == w.seq {
-		if err := c.flushFrame(true, nil); err != nil {
-			return err
-		}
+	err = wr.Close()
+	if err != nil {
+		return err
 	}
 	return nil
 }
+
+//func (c *Conn) WriteCompressedMessage(messageType int, level int, data []byte) error {
+//    wr, err := c.NextWriter(messageType)
+//    if err != nil {
+//        return err
+//    }
+//    compressed_w, err := flate.NewWriter(wr, level)
+//    if err != nil {
+//        return err
+//    }
+//    c.writeCompressed = true
+//    if _, err := compressed_w.write(true, data); err != nil {
+//        return err
+//    }
+
+//    w := wr.(messageWriter)
+//    if c.writeSeq == w.seq {
+//        if err := c.flushFrame(true, nil); err != nil {
+//            return err
+//        }
+//    }
+//    return nil
+//}
 
 // SetWriteDeadline sets the write deadline on the underlying network
 // connection. After a write has timed out, the websocket state is corrupt and
@@ -535,12 +578,16 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	final := b[0]&finalBit != 0
 	frameType := int(b[0] & 0xf)
-	reserved := int((b[0] >> 4) & 0x7)
+	compressed := b[0]&compressedBit != 0
+	other_reserved := int((b[0] &^ compressedBit >> 4) & 0x7)
 	mask := b[1]&maskBit != 0
 	c.readRemaining = int64(b[1] & 0x7f)
 
-	if reserved != 0 {
-		return noFrame, c.handleProtocolError("unexpected reserved bits " + strconv.Itoa(reserved))
+	if other_reserved != 0 {
+		return noFrame, c.handleProtocolError("unexpected reserved bits " + strconv.Itoa(other_reserved))
+	}
+	if compressed {
+		c.readCompressed = true
 	}
 
 	switch frameType {
@@ -674,6 +721,7 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		}
 		if frameType == TextMessage || frameType == BinaryMessage {
 			return frameType, messageReader{c, c.readSeq}, nil
+			//msg_reader := messageReader{c, c.readSeq}
 		}
 	}
 	return noFrame, nil, c.readErr
@@ -723,6 +771,12 @@ func (r messageReader) Read(b []byte) (n int, err error) {
 func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 	var r io.Reader
 	messageType, r, err = c.NextReader()
+	if err != nil {
+		return messageType, nil, err
+	}
+	if c.readProcessor != nil {
+		messageType, r, err = c.readProcessor(c, messageType, r)
+	}
 	if err != nil {
 		return messageType, nil, err
 	}

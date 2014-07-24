@@ -70,6 +70,7 @@ func NewClient(netConn net.Conn, u *url.URL, requestHeader http.Header, readBufS
 		return nil, resp, ErrBadHandshake
 	}
 	c.subprotocol = resp.Header.Get("Sec-Websocket-Protocol")
+	c.extensions = Extensions(resp.Header)
 	return c, resp, nil
 }
 
@@ -92,6 +93,9 @@ type Dialer struct {
 
 	// Subprotocols specifies the client's requested subprotocols.
 	Subprotocols []string
+
+	// Extensions specifies the client's requested extensions
+	Extensions []string
 }
 
 var errMalformedURL = errors.New("malformed ws or wss URL")
@@ -231,6 +235,14 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 			h[k] = v
 		}
 		h.Set("Sec-Websocket-Protocol", strings.Join(d.Subprotocols, ", "))
+		requestHeader = h
+	}
+	if len(d.Extensions) > 0 {
+		h := http.Header{}
+		for k, v := range requestHeader {
+			h[k] = v
+		}
+		h.Set("Sec-Websocket-Extensions", strings.Join(d.Extensions, ", "))
 		requestHeader = h
 	}
 
