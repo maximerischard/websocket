@@ -76,3 +76,44 @@ func ReadPerMessageDeflateWithTakeover(c *Conn, inputMessageType int, r io.Reade
 		return inputMessageType, r, nil
 	}
 }
+
+type closableFlateWriter struct {
+	original_writer   *io.WriteCloser
+	compressed_writer *flate.Writer
+}
+
+func (cfw closableFlateWriter) Write(p []byte) (n int, err error) {
+	n, err = cfw.compressed_writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+	// We need to a zero-byte at the end of the DEFLATE block
+	// why? I don't know, but otherwise it doesn't work
+	// http://stackoverflow.com/questions/22169036/websocket-permessage-deflate-in-chrome-with-no-context-takeover
+	n0, err := (*(cfw.original_writer)).Write([]byte{0})
+	return n + n0, err
+}
+
+func (cfw closableFlateWriter) Close() (err error) {
+	return (*(cfw.original_writer)).Close()
+}
+
+func WritePerMessageDeflateNoTakeover(c *Conn, w io.WriteCloser) (modifiedWriter io.WriteCloser, err error) {
+	flate_writer, err := flate.NewWriter(w, 8)
+	if err != nil {
+		return nil, err
+	}
+	closable_flate_writer := closableFlateWriter{&w, flate_writer}
+	return closable_flate_writer, nil
+}
+
+func WriterFromExtensions(c *Conn, w io.WriteCloser) (modifiedWriter io.WriteCloser, err error) {
+	for _, ext := range c.extensions {
+		if ext.Token == "permessage-deflate" {
+			if _, no_takeover := ext.Params["server-no-context-takeover"]; no_takeover {
+				return WritePerMessageDeflateNoTakeover(c, w)
+			}
+		}
+	}
+	return w, nil
+}

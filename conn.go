@@ -161,7 +161,7 @@ type Conn struct {
 	decompressor   io.Reader
 	compressor     io.Writer
 	readProcessor  func(c *Conn, inputMessageType int, r io.Reader) (messageType int, modifiedReader io.Reader, err error)
-	writeProcessor func(c *Conn, w io.Writer) (modifiedWriter io.WriteCloser, err error)
+	writeProcessor func(c *Conn, w io.WriteCloser) (modifiedWriter io.WriteCloser, err error)
 }
 
 func newConn(conn net.Conn, isServer bool, readBufSize, writeBufSize int) *Conn {
@@ -178,6 +178,7 @@ func newConn(conn net.Conn, isServer bool, readBufSize, writeBufSize int) *Conn 
 		writeFrameType: noFrame,
 		writePos:       maxFrameHeaderSize,
 	}
+	c.writeProcessor = WriterFromExtensions
 	c.SetPingHandler(nil)
 	c.SetPongHandler(nil)
 	return c
